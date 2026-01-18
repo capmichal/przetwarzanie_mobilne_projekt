@@ -19,16 +19,28 @@ USE_GSHEETS = "connections" in st.secrets and "gsheets" in st.secrets.connection
 def load_data():
     try:
         if USE_GSHEETS:
+            st.info("🔄 Łączenie z Google Sheets...")
             conn = st.connection("gsheets", type=GSheetsConnection)
             # Odczytujemy zakładki zdefiniowane w Google Sheets
+            st.info("📥 Pobieranie danych z arkusza 'results'...")
             results = conn.read(worksheet="results")
+            st.info("📥 Pobieranie danych z arkusza 'predictions'...")
             preds = conn.read(worksheet="predictions")
+            st.success("✅ Dane załadowane pomyślnie!")
         else:
             # Rezerwowe ładowanie lokalne
             results = pd.read_csv('results.csv')
             preds = pd.read_csv('predictions.csv')
     except Exception as e:
-        st.error(f"Błąd ładowania danych: {e}")
+        import traceback
+        st.error(f"❌ Błąd ładowania danych:")
+        st.error(f"**Typ błędu:** {type(e).__name__}")
+        st.error(f"**Komunikat:** {str(e)}")
+        st.code(traceback.format_exc())
+        st.warning("💡 Sprawdź czy:\n"
+                   "- Arkusz Google Sheets ma zakładki o nazwach 'results' i 'predictions'\n"
+                   "- Service account ma dostęp do arkusza (został dodany przez 'Share')\n"
+                   "- Google Sheets API jest włączone w projekcie Google Cloud")
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     # Łączenie danych po match_id 
@@ -56,6 +68,8 @@ def save_data(edited_preds):
         if USE_GSHEETS:
             conn = st.connection("gsheets", type=GSheetsConnection)
             conn.update(worksheet="predictions", data=edited_preds)
+            # Wyczyść cache, aby załadować świeże dane
+            st.cache_data.clear()
             st.success("Zapisano zmiany w Google Sheets!")
         else:
             edited_preds.to_csv('predictions.csv', index=False)
@@ -65,6 +79,8 @@ def save_data(edited_preds):
 
 # --- URUCHOMIENIE LOGIKI DANYCH ---
 df, raw_results, raw_preds = load_data()
+#st.write("Podgląd tabeli results:", raw_results.head())
+#st.write("Podgląd tabeli predictions:", raw_preds.head())
 
 if not df.empty:
     st.title("⚽ Analizator predykcji meczów piłkarskich")
