@@ -2,105 +2,115 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from streamlit_gsheets import GSheetsConnection
 
 # --- KONFIGURACJA STRONY ---
 st.set_page_config(
-    page_title="Analizator Predykcji Piłkarskich",
+    page_title="Analizator Predykcji - Michał Olejnik",
     page_icon="⚽",
     layout="wide"
 )
 
-# --- FUNKCJA ŁADOWANIA DANYCH ---
+# --- LOGIKA WYBORU ŹRÓDŁA DANYCH (HYBRYDOWA) ---
+# Sprawdzamy dostępność połączenia z Google Sheets w st.secrets
+USE_GSHEETS = "connections" in st.secrets and "gsheets" in st.secrets.connections
+
+# --- FUNKCJE ŁADOWANIA I ZAPISU DANYCH ---
 def load_data():
     try:
-        results = pd.read_csv('results.csv')
-        preds = pd.read_csv('predictions.csv')
-    except Exception:
-        st.error("Błąd ładowania plików CSV. Upewnij się, że results.csv i predictions.csv są w folderze.")
-        return pd.DataFrame()
+        if USE_GSHEETS:
+            conn = st.connection("gsheets", type=GSheetsConnection)
+            # Odczytujemy zakładki zdefiniowane w Google Sheets
+            results = conn.read(worksheet="results")
+            preds = conn.read(worksheet="predictions")
+        else:
+            # Rezerwowe ładowanie lokalne
+            results = pd.read_csv('results.csv')
+            preds = pd.read_csv('predictions.csv')
+    except Exception as e:
+        st.error(f"Błąd ładowania danych: {e}")
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
+    # Łączenie danych po match_id 
     df = pd.merge(results, preds, on='match_id')
     df['Date'] = pd.to_datetime(df['Date'], dayfirst=True)
     df['has_prediction'] = df['pred_home_score'].notna()
     
+    # Czyszczenie danych do porównania (standard H/D/A)
     def clean_str(val):
         return str(val).strip().upper() if pd.notna(val) else ""
 
     if df['has_prediction'].any():
+        # Porównanie zwycięzcy 
         df.loc[df['has_prediction'], 'correct_winner'] = (
             df['FTR'].apply(clean_str) == df['pred_winner'].apply(clean_str)
         )
+        # Analiza liczbowa pomyłki bramkowej 
         df.loc[df['has_prediction'], 'total_error'] = (
             abs(df['FTHG'] - df['pred_home_score']) + abs(df['FTAG'] - df['pred_away_score'])
         )
-    return df
+    return df, results, preds
 
-df = load_data()
+def save_data(edited_preds):
+    try:
+        if USE_GSHEETS:
+            conn = st.connection("gsheets", type=GSheetsConnection)
+            conn.update(worksheet="predictions", data=edited_preds)
+            st.success("Zapisano zmiany w Google Sheets!")
+        else:
+            edited_preds.to_csv('predictions.csv', index=False)
+            st.success("Zapisano zmiany w lokalnym pliku CSV!")
+    except Exception as e:
+        st.error(f"Błąd zapisu: {e}")
+
+# --- URUCHOMIENIE LOGIKI DANYCH ---
+df, raw_results, raw_preds = load_data()
 
 if not df.empty:
-    st.title("⚽ Interaktywny Analizator Predykcji")
-    
+    st.title("⚽ Analizator predykcji meczów piłkarskich")
+    st.caption("Autor: Michał Olejnik 148210 | Projekt: Systemy Mobilne 2025")
+
+    if USE_GSHEETS:
+        st.sidebar.success("Tryb: Online (Google Sheets)")
+    else:
+        st.sidebar.info("Tryb: Lokalny (Pliki CSV)")
+
     # --- SEKCJA 1: ANALIZA SZCZEGÓŁOWA MECZU ---
-    st.header("🔍 Szczegóły meczu")
+    st.header("🔍 Analiza konkretnego spotkania")
     
-    # Przygotowanie listy meczów
+    # Lista meczów do wyboru 
     df['match_label'] = df['Date'].dt.strftime('%Y-%m-%d') + ": " + df['HomeTeam'] + " vs " + df['AwayTeam']
-    match_labels = df['match_label'].tolist()
-    
-    selected_label = st.selectbox("Wybierz mecz z listy:", options=match_labels)
-    m = df[df['match_label'] == selected_label].iloc[0]
+    selected_match = st.selectbox("Wybierz mecz z listy:", options=df['match_label'].tolist())
+    m = df[df['match_label'] == selected_label if 'selected_label' in locals() else df['match_label'] == selected_match].iloc[0]
 
     if not m['has_prediction']:
-        st.warning("⚠️ Brak Twojej predykcji dla tego meczu.")
+        st.warning("⚠️ Ten mecz nie został jeszcze obstawiony. Wprowadź typ w edytorze na dole, aby odblokować wyniki.")
     else:
-        # NOWOŚĆ: Wybór typu wykresu dla konkretnego meczu
-        chart_type = st.radio(
-            "Wybierz formę przedstawienia danych:",
-            ["Słupkowy (Porównanie)", "Radarowy (Profil meczu)"],
-            horizontal=True
-        )
-
-        c_m1, c_m2 = st.columns([2, 1])
-        with c_m1:
-            if chart_type == "Słupkowy (Porównanie)":
-                fig_match = go.Figure(data=[
+        # Interaktywna zmiana formy wykresu
+        chart_mode = st.radio("Forma wizualizacji:", ["Słupkowy (Klasyczny)", "Radarowy (Profil błędu)"], horizontal=True)
+        
+        col_m1, col_m2 = st.columns([2, 1])
+        with col_m1:
+            if chart_mode == "Słupkowy (Klasyczny)":
+                fig = go.Figure(data=[
                     go.Bar(name='Faktyczny Wynik', x=[m['HomeTeam'], m['AwayTeam']], y=[m['FTHG'], m['FTAG']], marker_color='#3498db'),
                     go.Bar(name='Twoja Predykcja', x=[m['HomeTeam'], m['AwayTeam']], y=[m['pred_home_score'], m['pred_away_score']], marker_color='#f1c40f')
                 ])
-                fig_match.update_layout(barmode='group', height=350, title="Zestawienie bramek: Fakty vs Predykcja")
-            
-            else: # Wykres Radarowy
+                fig.update_layout(barmode='group', title="Zestawienie bramek")
+            else:
+                fig = go.Figure()
                 categories = ['Gole Gospodarzy', 'Gole Gości']
-                fig_match = go.Figure()
-                fig_match.add_trace(go.Scatterpolar(
-                    r=[m['FTHG'], m['FTAG']],
-                    theta=categories,
-                    fill='toself',
-                    name='Faktyczny Wynik',
-                    line_color='#3498db'
-                ))
-                fig_match.add_trace(go.Scatterpolar(
-                    r=[m['pred_home_score'], m['pred_away_score']],
-                    theta=categories,
-                    fill='toself',
-                    name='Twoja Predykcja',
-                    line_color='#f1c40f'
-                ))
-                fig_match.update_layout(
-                    polar=dict(radialaxis=dict(visible=True, range=[0, max(5, m['FTHG'], m['FTAG'], m['pred_home_score'], m['pred_away_score'])])),
-                    showlegend=True,
-                    height=350,
-                    title="Radar porównawczy"
-                )
+                fig.add_trace(go.Scatterpolar(r=[m['FTHG'], m['FTAG']], theta=categories, fill='toself', name='Fakty', line_color='#3498db'))
+                fig.add_trace(go.Scatterpolar(r=[m['pred_home_score'], m['pred_away_score']], theta=categories, fill='toself', name='Predykcja', line_color='#f1c40f'))
+                fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 5])), title="Radar bramkowy")
             
-            st.plotly_chart(fig_match, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True)
 
-        with c_m2:
-            st.subheader("Werdykt")
-            st.write(f"**Data:** {m['Date'].strftime('%Y-%m-%d')}")
-            st.write(f"**Wynik:** {int(m['FTHG'])}:{int(m['FTAG'])}")
+        with col_m2:
+            st.subheader("Wynik analizy")
+            st.write(f"**Prawdziwy wynik:** {int(m['FTHG'])}:{int(m['FTAG'])}")
             st.write(f"**Twoja predykcja:** {int(m['pred_home_score'])}:{int(m['pred_away_score'])}")
-            st.metric("Błąd goli", int(m['total_error']))
+            st.metric("Suma błędu", int(m['total_error']))
             if m['correct_winner']: st.success("Trafiony zwycięzca!")
             else: st.error("Nietrafiony zwycięzca")
 
@@ -108,76 +118,49 @@ if not df.empty:
 
     # --- SEKCJA 2: TREND I ZAKRES DAT ---
     st.header("📈 Historia trafności w czasie")
-    
     df_played = df[df['has_prediction']].sort_values('Date').copy()
 
     if not df_played.empty:
-        # NOWOŚĆ: Interaktywny wybór zakresu dat
-        st.subheader("Filtruj historię")
-        min_date = df_played['Date'].min().to_pydatetime()
-        max_date = df_played['Date'].max().to_pydatetime()
-        
-        date_range = st.date_input(
-            "Wybierz zakres dat do analizy:",
-            value=(min_date, max_date),
-            min_value=min_date,
-            max_value=max_date
-        )
+        # Interaktywny zakres dat 
+        d_min, d_max = df_played['Date'].min().to_pydatetime(), df_played['Date'].max().to_pydatetime()
+        date_range = st.date_input("Zakres czasu:", value=(d_min, d_max), min_value=d_min, max_value=d_max)
 
-        # Filtrowanie danych na podstawie wybranego zakresu
         if isinstance(date_range, tuple) and len(date_range) == 2:
-            start_date, end_date = date_range
-            mask = (df_played['Date'].dt.date >= start_date) & (df_played['Date'].dt.date <= end_date)
-            df_filtered = df_played.loc[mask]
-        else:
-            df_filtered = df_played
+            df_filtered = df_played[(df_played['Date'].dt.date >= date_range[0]) & (df_played['Date'].dt.date <= date_range[1])]
+            
+            if not df_filtered.empty:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Skuteczność (1X2)", f"{df_filtered['correct_winner'].mean()*100:.1f}%")
+                c2.metric("Średni błąd", f"{df_filtered['total_error'].mean():.2f}")
+                c3.metric("Liczba meczów", len(df_filtered))
 
-        if not df_filtered.empty:
-            # Metryki dla wybranego zakresu
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Skuteczność (wybrany zakres)", f"{df_filtered['correct_winner'].mean()*100:.1f}%")
-            col2.metric("Średni błąd (wybrany zakres)", f"{df_filtered['total_error'].mean():.2f}")
-            col3.metric("Liczba meczów", len(df_filtered))
-
-            # Wykres trendu
-            fig_trend = go.Figure()
-            fig_trend.add_trace(go.Scatter(
-                x=df_filtered['Date'], y=df_filtered['total_error'],
-                mode='lines+markers',
-                line=dict(color='lightgrey', width=1),
-                marker=dict(
-                    color=['#2ecc71' if c else '#e74c3c' for c in df_filtered['correct_winner']],
-                    size=12,
-                    line=dict(width=1, color='DarkSlateGrey')
-                ),
-                customdata=df_filtered['match_label'],
-                hovertemplate="<b>%{customdata}</b><br>Błąd: %{y} goli<br>Data: %{x}<extra></extra>"
-            ))
-
-            fig_trend.update_layout(
-                xaxis_title="Data meczu",
-                yaxis_title="Suma błędu bramkowego",
-                height=450,
-                title="Trend trafności (Zielony = trafiony zwycięzca, Czerwony = błąd)"
-            )
-            st.plotly_chart(fig_trend, use_container_width=True)
-        else:
-            st.warning("Brak meczów w wybranym zakresie dat.")
+                # Wykres trendu
+                fig_trend = px.line(df_filtered, x='Date', y='total_error', title="Trend błędu bramkowego")
+                fig_trend.add_trace(go.Scatter(
+                    x=df_filtered['Date'], y=df_filtered['total_error'], mode='markers',
+                    marker=dict(color=['#2ecc71' if c else '#e74c3c' for c in df_filtered['correct_winner']], size=12),
+                    name="Trafność zwycięzcy"
+                ))
+                st.plotly_chart(fig_trend, use_container_width=True)
+            else:
+                st.warning("Brak danych w wybranym zakresie.")
     else:
-        st.info("Obstaw mecze w edytorze poniżej, aby zobaczyć statystyki historyczne.")
+        st.info("Obstaw mecze, aby zobaczyć statystyki czasowe.")
 
     st.divider()
 
     # --- SEKCJA 3: EDYTOR DANYCH ---
-    st.header("📝 Edytor Twoich predykcji")
-    cols_to_edit = ['match_id', 'HomeTeam', 'AwayTeam', 'pred_home_score', 'pred_away_score', 'pred_winner']
-    edited_df = st.data_editor(df[cols_to_edit], num_rows="fixed", key="data_editor")
+    st.header("📝 Edytor predykcji")
+    st.write("Wprowadź swoje typy. System zapisze je w wybranym źródle (CSV lub Google Sheets).")
+    
+    # Interaktywne środowisko do edycji 
+    edit_cols = ['match_id', 'HomeTeam', 'AwayTeam', 'pred_home_score', 'pred_away_score', 'pred_winner']
+    new_data = st.data_editor(df[edit_cols], num_rows="fixed")
 
-    if st.button("💾 Zapisz zmiany do pliku"):
-        save_df = edited_df[['match_id', 'pred_home_score', 'pred_away_score', 'pred_winner']]
-        save_df.to_csv('predictions.csv', index=False)
-        st.success("Zapisano pomyślnie!")
+    if st.button("💾 Zapisz zmiany"):
+        save_df = new_data[['match_id', 'pred_home_score', 'pred_away_score', 'pred_winner']]
+        save_data(save_df)
         st.rerun()
 
 else:
-    st.warning("Nie udało się załadować danych.")
+    st.error("Nie udało się załadować danych aplikacji.")
